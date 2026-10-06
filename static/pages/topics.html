@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>文档话题聚类 - NLP 流水线平台</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+  <style>
+    .topic-grid { display:grid; grid-template-columns: minmax(0, .9fr) minmax(0, 1.1fr); gap:20px; }
+    .topic-card { border:1px solid var(--border); border-radius:10px; padding:14px; margin-bottom:12px;
+      background:#fff; cursor:pointer; transition:.15s; }
+    .topic-card:hover, .topic-card.active { border-color:var(--primary); box-shadow:var(--shadow); }
+    .topic-card .head { display:flex; justify-content:space-between; gap:10px; align-items:flex-start; }
+    .topic-card h3 { margin:0; color:var(--text); font-size:15px; }
+    .topic-keywords { display:flex; flex-wrap:wrap; gap:6px; margin-top:9px; }
+    .topic-keywords span { font-size:12px; padding:2px 8px; border-radius:999px;
+      background:var(--primary-soft); color:var(--primary); }
+    .topic-rep { margin-top:10px; font-size:12px; color:var(--text-muted); overflow:hidden;
+      text-overflow:ellipsis; white-space:nowrap; }
+    .map-wrap { min-height:430px; position:relative; }
+    .bubble { position:absolute; transform:translate(-50%,-50%); border:2px solid;
+      border-radius:14px; padding:8px 10px; background:rgba(255,255,255,.88); cursor:pointer;
+      box-shadow:var(--shadow); text-align:center; max-width:150px; }
+    .bubble strong { display:block; font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .bubble small { display:block; color:var(--text-muted); margin-top:2px; }
+    .line { position:absolute; transform-origin:0 50%; height:1px; background:#cbd5e1; opacity:.65; pointer-events:none; }
+    .doc-item { padding:11px 0; border-bottom:1px solid var(--border); }
+    .doc-item:last-child { border-bottom:none; }
+    .doc-title { font-weight:600; display:flex; justify-content:space-between; gap:10px; }
+    .doc-preview { color:var(--text-muted); font-size:13px; margin-top:4px; white-space:pre-wrap; }
+    .score-track { width:90px; height:7px; background:#eef0f6; border-radius:999px; overflow:hidden; flex:none; }
+    .score-fill { height:100%; background:var(--primary); }
+    @media (max-width: 980px) { .topic-grid { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="site-sidebar"></aside>
+
+  <main class="main">
+    <h1 class="page-title">文档话题聚类</h1>
+    <p class="page-desc">按 TF-IDF 语义自动划分话题簇，支持自动估计/指定话题数、增量更新、稳定簇编号与代表文档查看。</p>
+
+    <section class="card">
+      <div class="row">
+        <div style="width:170px">
+          <label>话题数量</label>
+          <select id="topic-count">
+            <option value="auto">自动估计</option>
+            <option value="2">2</option><option value="3">3</option><option value="4">4</option>
+            <option value="5">5</option><option value="6">6</option><option value="7">7</option>
+            <option value="8">8</option><option value="9">9</option><option value="10">10</option>
+          </select>
+        </div>
+        <div style="width:140px">
+          <label>自动上限</label><input id="max-topics" type="number" min="2" max="12" value="8">
+        </div>
+        <button class="btn" id="btn-build">聚类 / 重算</button>
+        <button class="btn secondary" id="btn-sync">仅增量更新</button>
+        <span class="muted small" id="status">加载中…</span>
+      </div>
+      <p class="muted small mt">新增、删除或修改语料后，“增量更新”只扫描变化分片；多次聚类使用确定性初始化，簇编号和标签保持稳定。</p>
+    </section>
+
+    <div class="topic-grid">
+      <section class="card">
+        <div class="toolbar"><h2 style="margin:0;flex:1">话题列表</h2><span id="auto-badge" class="badge blue"></span></div>
+        <div id="topic-list"><div class="muted">加载中…</div></div>
+      </section>
+      <section class="card">
+        <h2>簇间远近</h2>
+        <div class="map-wrap" id="topic-map"><div class="muted">尚无聚类结果。</div></div>
+        <p class="muted small">气泡位置由簇质心距离（MDS）投影；距离越近话题越相近。面积表示文档数量。</p>
+      </section>
+    </div>
+
+    <section class="card">
+      <div class="toolbar">
+        <h2 style="margin:0;flex:1" id="detail-title">代表文档</h2>
+        <button class="btn secondary small" id="btn-more">加载更多</button>
+      </div>
+      <div id="detail-body" class="muted">点击左侧话题查看代表文档。</div>
+    </section>
+  </main>
+</div>
+
+<script src="/static/js/common.js"></script>
+<script>
+renderNav("topics.html");
+const COLORS = ["#4f6ef7","#16a34a","#d97706","#dc2626","#7c3aed","#0891b2","#be185d","#65a30d","#ea580c","#2563eb"];
+let clusters = [], selectedId = null, detailOffset = 0, detailHasMore = false;
+
+function setBusy(btn, on, text) {
+  if (on) return setLoading(btn, true, text);
+  return setLoading(btn, false);
+}
+
+async function build(force) {
+  const btn = force ? $("#btn-build") : $("#btn-sync");
+  setBusy(btn, true, force ? "聚类中…" : "同步中…");
+  try {
+    const body = { max_topics: parseInt($("#max-topics").value, 10) };
+    const count = $("#topic-count").value;
+    if (count !== "auto") body.topics = parseInt(count, 10);
+    if (force) body.force = true;
+    const path = force ? "/api/topics/build" : "/api/topics/sync";
+    const r = await api(path, { method:"POST", body });
+    renderResult(r);
+    const c = r.changes || {};
+    toast(force ? "话题聚类完成" :
+      `增量同步：新增 ${c.added||0}，修改 ${c.updated||0}，删除 ${c.deleted||0}`);
+  } catch (e) { toast(e.message, "err"); }
+  setBusy(btn, false);
+}
+
+async function load() {
+  try {
+    const r = await api("/api/topics");
+    if (!r.topics) {
+      clusters = [];
+      $("#status").textContent = `${r.document_count || 0} 篇文档 · 尚未聚类`;
+      $("#topic-list").innerHTML = '<div class="muted">点击“聚类 / 重算”生成话题。</div>';
+      $("#topic-map").innerHTML = '<div class="muted">尚无聚类结果。</div>';
+      return;
+    }
+    renderResult(r);
+  } catch (e) { $("#status").textContent = e.message; }
+}
+
+function renderResult(r) {
+  clusters = r.clusters || [];
+  $("#status").textContent = `${r.document_count} 篇文档 · ${r.topics} 个话题 · 更新于 ${fmtTime(r.updated_at)}`;
+  $("#auto-badge").textContent = r.auto ? "话题数自动估计" : `指定 ${r.topics} 簇`;
+  renderTopics();
+  renderMap();
+  if (!selectedId || !clusters.some(c => c.id === selectedId)) {
+    selectedId = clusters[0] ? clusters[0].id : null;
+    detailOffset = 0;
+  }
+  loadDetail(true);
+}
+
+function renderTopics() {
+  if (!clusters.length) {
+    $("#topic-list").innerHTML = '<div class="muted">没有可聚类的文档。</div>';
+    return;
+  }
+  $("#topic-list").innerHTML = clusters.map((c, i) => `
+    <div class="topic-card ${c.id===selectedId?"active":""}" onclick="selectTopic('${esc(c.id)}')">
+      <div class="head">
+        <h3><span style="color:${COLORS[i%COLORS.length]}">●</span> ${esc(c.label)}</h3>
+        <span class="badge blue small">${c.size} 篇</span>
+      </div>
+      <div class="topic-keywords">${c.keywords.slice(0,7).map(k=>`<span>${esc(k.term)}</span>`).join("")}</div>
+      <div class="topic-rep">代表：${esc(c.representatives[0]?.name || "暂无")} · 内聚 ${c.cohesion}</div>
+    </div>`).join("");
+}
+
+function renderMap() {
+  const host = $("#topic-map");
+  if (!clusters.length) { host.innerHTML = '<div class="muted">尚无聚类结果。</div>'; return; }
+  const W = Math.max(host.clientWidth || 560, 420), H = 410, pad = 70;
+  const xs = clusters.map(c=>c.x), ys = clusters.map(c=>c.y);
+  const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
+  const sx = v => pad + ((v-minX)/((maxX-minX)||1))*(W-2*pad);
+  const sy = v => H-pad - ((v-minY)/((maxY-minY)||1))*(H-2*pad);
+  const pos = clusters.map(c=>({x:sx(c.x), y:sy(c.y)}));
+  let lines = "";
+  for (let i=0;i<clusters.length;i++) for (let j=i+1;j<clusters.length;j++) {
+    const a=pos[i], b=pos[j], dx=b.x-a.x, dy=b.y-a.y, len=Math.hypot(dx,dy), angle=Math.atan2(dy,dx)*180/Math.PI;
+    lines += `<div class="line" style="left:${a.x}px;top:${a.y}px;width:${len}px;transform:rotate(${angle}deg)"></div>`;
+  }
+  const maxSize = Math.max(...clusters.map(c=>c.size), 1);
+  const bubbles = clusters.map((c,i)=>{
+    const p=pos[i], w=104+Math.min(60,c.size/maxSize*60), h=52+Math.min(24,c.size/maxSize*24);
+    return `<div class="bubble" style="left:${p.x}px;top:${p.y}px;width:${w}px;min-height:${h}px;border-color:${COLORS[i%COLORS.length]}" onclick="selectTopic('${esc(c.id)}')">
+      <strong>${esc(c.label.split("/")[0])}</strong><small>${c.size} 篇</small></div>`;
+  }).join("");
+  host.innerHTML = `<div style="position:relative;width:100%;height:${H}px">${lines}${bubbles}</div>`;
+}
+
+async function selectTopic(id) {
+  selectedId = id; detailOffset = 0;
+  renderTopics();
+  await loadDetail(true);
+}
+
+async function loadDetail(reset) {
+  if (!selectedId) return;
+  if (reset) detailOffset = 0;
+  const cluster = clusters.find(c=>c.id===selectedId);
+  $("#detail-title").textContent = `${cluster ? cluster.label : ""} · 文档`;
+  try {
+    const r = await api(`/api/topics/${encodeURIComponent(selectedId)}?limit=30&offset=${detailOffset}`);
+    detailHasMore = detailOffset + r.documents.length < r.total;
+    const htmlDocs = (reset ? r.representatives : [])
+      .map(d => renderDoc(d, true)).join("") +
+      (reset ? '<h3 class="mt mb">全部文档</h3>' : "") +
+      r.documents.map(d => renderDoc(d, false)).join("");
+    $("#detail-body").innerHTML = htmlDocs || '<div class="muted">该话题暂无文档。</div>';
+    $("#btn-more").style.display = detailHasMore ? "inline-flex" : "none";
+  } catch(e) { toast(e.message,"err"); }
+}
+
+function renderDoc(d, representative) {
+  const pct = Math.max(0, Math.min(100, Math.round((d.score||0)*100)));
+  return `<div class="doc-item">
+    <div class="doc-title"><span>${representative ? "⭐ " : ""}${esc(d.name)}
+      <span class="muted small">分片 ${d.shard ?? "-"}</span></span>
+      <span class="score-track" title="归属置信度"><span class="score-fill" style="width:${pct}%"></span></span></div>
+    <div class="doc-preview">${esc(d.preview || "")}</div>
+    <div class="muted small mt">置信度 ${d.score}${d.ambiguity ? ` · 次优簇差距 ${d.ambiguity}` : ""} · ${fmtTime(d.created_at)}</div>
+  </div>`;
+}
+
+$("#btn-build").addEventListener("click", () => build(true));
+$("#btn-sync").addEventListener("click", () => build(false));
+$("#topic-count").addEventListener("change", () => { if (clusters.length) build(true); });
+$("#max-topics").addEventListener("change", () => { if ($("#topic-count").value === "auto" && clusters.length) build(true); });
+$("#btn-more").addEventListener("click", async () => { detailOffset += 30; await loadDetail(false); });
+window.addEventListener("resize", renderMap);
+load();
+</script>
+</body>
+</html>

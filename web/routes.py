@@ -18,6 +18,7 @@ from nlp import (get_constituency_parser, get_embeddings, get_keywords, get_ner,
                  get_parser, get_segmenter, get_sentiment, get_summarizer,
                  get_tagger, get_translator, ENTITY_TYPE_NAMES, TAG_NAMES,
                  DEP_REL_NAMES, PHRASE_NAMES, POLARITY_NAMES)
+from nlp.topic_service import DEFAULT_MAX_TOPICS, TopicModelService
 from nlp.lexicon import STOPWORDS
 from storage import StoreRegistry
 
@@ -42,6 +43,19 @@ def _models_dir() -> str:
     path = os.path.join(current_app.config["DATA_ROOT"], "models")
     os.makedirs(path, exist_ok=True)
     return path
+
+
+def _topic_service() -> TopicModelService:
+    import os
+    services = current_app.config.setdefault("TOPIC_SERVICES", {})
+    if "current" not in services:
+        state_dir = os.path.join(current_app.config["DATA_ROOT"], "topics")
+        os.makedirs(state_dir, exist_ok=True)
+        services["current"] = TopicModelService(
+            _registry().task("corpus"),
+            os.path.join(state_dir, "current.json"),
+        )
+    return services["current"]
 
 
 def _store_result(task: str, text: str, result: dict,
@@ -354,6 +368,71 @@ def keywords():
                                     method=data.get("method", "hybrid"))
     rid = _store_result("keywords", text, result, corpus_id=cid)
     result["id"] = rid
+    return jsonify(result)
+
+
+# ---------------------------------------------------------------------------
+# 话题聚类
+# ---------------------------------------------------------------------------
+
+@api.post("/topics/build")
+def build_topics():
+    data = _payload()
+    topics = data.get("topics") or data.get("n_clusters")
+    if topics in ("", "auto"):
+        topics = None
+    elif topics is not None:
+        try:
+            topics = max(1, int(topics))
+        except (TypeError, ValueError):
+            return jsonify({"error": "话题数必须是正整数或 auto"}), 400
+    try:
+        max_topics = int(data.get("max_topics", DEFAULT_MAX_TOPICS) or DEFAULT_MAX_TOPICS)
+    except (TypeError, ValueError):
+        return jsonify({"error": "自动话题上限必须是整数"}), 400
+    force = bool(data.get("force", False))
+    try:
+        result = _topic_service().build(
+            requested_topics=topics,
+            max_topics=max(2, min(max_topics, 12)),
+            force=force,
+        )
+        return jsonify(result)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"话题聚类失败：{exc}"}), 400
+
+
+@api.post("/topics/sync")
+def sync_topics():
+    try:
+        return jsonify(_topic_service().sync())
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"增量同步失败：{exc}"}), 400
+
+
+@api.get("/topics")
+def list_topics():
+    service = _topic_service()
+    if not service.state.get("clusters"):
+        return jsonify({
+            "topics": 0,
+            "document_count": _registry().task("corpus").stats().get("total", 0),
+            "clusters": [],
+            "distances": [],
+            "message": "尚未生成话题，请先点击自动聚类。",
+        })
+    limit = request.args.get("limit", default=0, type=int)
+    offset = request.args.get("offset", default=0, type=int)
+    return jsonify(service.snapshot(doc_limit=limit, doc_offset=offset))
+
+
+@api.get("/topics/<cluster_id>")
+def topic_detail(cluster_id: str):
+    limit = request.args.get("limit", default=50, type=int)
+    offset = request.args.get("offset", default=0, type=int)
+    result = _topic_service().get_cluster(cluster_id, limit=limit, offset=offset)
+    if result is None:
+        return jsonify({"error": "话题簇不存在"}), 404
     return jsonify(result)
 
 

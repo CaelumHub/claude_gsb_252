@@ -188,6 +188,30 @@ class ShardedStore:
             self._write_meta(meta)
         return ids
 
+    def shard_fingerprints(self) -> list[dict]:
+        """返回分片文件指纹，供增量任务判断哪些分片发生变化。"""
+        with FileLock(lock_path_for(self.meta_path), mode="shared"):
+            meta = self._read_meta()
+            result = []
+            for index in range(meta.get("shard_count", 0)):
+                path = self._shard_path(index)
+                try:
+                    stat = os.stat(path)
+                    result.append({"index": index, "size": stat.st_size,
+                                   "mtime": stat.st_mtime})
+                except FileNotFoundError:
+                    result.append({"index": index, "size": -1, "mtime": 0})
+            return result
+
+    def read_shard(self, index: int) -> list[dict]:
+        """只读单个分片，供增量任务做局部变更检测。"""
+        with FileLock(lock_path_for(self.meta_path), mode="shared"):
+            meta = self._read_meta()
+            if index < 0 or index >= meta.get("shard_count", 0):
+                return []
+            with FileLock(lock_path_for(self._shard_path(index)), mode="shared"):
+                return self._read_shard(index)
+
     # -- 查询 -------------------------------------------------------------
     def _iter_all_locked(self) -> Iterator[dict]:
         meta = self._read_meta()

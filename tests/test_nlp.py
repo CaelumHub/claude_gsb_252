@@ -21,6 +21,8 @@ from nlp import (get_segmenter, get_tagger, get_parser, get_constituency_parser,
                  get_ner, get_sentiment, get_summarizer, get_translator,
                  get_keywords, get_embeddings, TAGSET)
 from nlp.hmm import HMM
+from nlp.topic_service import TopicModelService
+from nlp.topics import tokenize_text
 from pipeline import PipelineEngine, PipelineError
 from storage import ShardedStore, StoreRegistry
 
@@ -149,6 +151,75 @@ class TestEmbeddings(unittest.TestCase):
         # 2D 投影
         proj = emb.project_2d()
         self.assertEqual(len(proj), len(emb.vectors))
+
+
+class TestTopicClustering(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.store = ShardedStore(self.tmp, "corpus", shard_size=2)
+        self.path = os.path.join(self.tmp, "topics", "current.json")
+        self.docs = [
+            "机器学习和深度学习使用神经网络训练模型",
+            "神经网络模型提升了机器学习与图像识别效果",
+            "自然语言处理包括分词、词性标注和实体识别",
+            "关键词提取和文本摘要是自然语言处理任务",
+            "股票市场上涨，投资者关注宏观经济与货币政策",
+            "银行发布利率报告，分析宏观经济增长和金融市场",
+        ]
+        self.ids = [self.store.insert({"name": f"文档{i}", "text": text})
+                    for i, text in enumerate(self.docs)]
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_fixed_topics_and_labels(self):
+        service = TopicModelService(self.store, self.path)
+        result = service.build(requested_topics=3)
+        self.assertEqual(result["topics"], 3)
+        self.assertEqual(sum(c["size"] for c in result["clusters"]), len(self.docs))
+        labels = {c["label"] for c in result["clusters"]}
+        self.assertTrue(any("学习" in label or "网络" in label for label in labels))
+        self.assertTrue(any("处理" in label or "语言" in label for label in labels))
+
+    def test_stable_full_build(self):
+        first = TopicModelService(self.store, self.path).build(requested_topics=3)
+        second = TopicModelService(self.store, self.path).build(
+            requested_topics=3, force=True)
+        self.assertEqual(
+            [(c["id"], c["label"], c["size"]) for c in first["clusters"]],
+            [(c["id"], c["label"], c["size"]) for c in second["clusters"]],
+        )
+
+    def test_incremental_add_delete(self):
+        service = TopicModelService(self.store, self.path)
+        service.build(requested_topics=3)
+        new_id = self.store.insert({
+            "name": "新增",
+            "text": "深度学习神经网络和机器学习图像识别算法",
+        })
+        result = service.sync()
+        self.assertEqual(result["changes"]["added"], 1)
+        self.assertEqual(result["changes"]["rescanned_shards"], 1)
+        self.assertFalse(result["changes"]["rebuilt"])
+        self.assertEqual(sum(c["size"] for c in result["clusters"]),
+                         len(self.docs) + 1)
+
+        self.store.delete(new_id)
+        result = service.sync()
+        self.assertEqual(result["changes"]["deleted"], 1)
+        self.assertEqual(sum(c["size"] for c in result["clusters"]), len(self.docs))
+        self.assertTrue(all(c["id"].startswith("topic_")
+                            for c in result["clusters"]))
+
+    def test_persistence_and_detail(self):
+        service = TopicModelService(self.store, self.path)
+        built = service.build(requested_topics=3)
+        cid = built["clusters"][0]["id"]
+        reloaded = TopicModelService(self.store, self.path)
+        detail = reloaded.get_cluster(cid)
+        self.assertEqual(detail["total"], built["clusters"][0]["size"])
+        self.assertTrue(detail["representatives"])
+        self.assertTrue(tokenize_text("自然语言处理和机器学习"))
 
 
 class TestHMM(unittest.TestCase):
