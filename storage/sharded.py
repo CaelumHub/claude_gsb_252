@@ -255,6 +255,34 @@ class ShardedStore:
                 return False
         return True
 
+    # -- 更新 -------------------------------------------------------------
+    def update(self, record_id: str, fields: dict) -> bool:
+        """就地更新一条记录的若干字段（保留 id 与未提及字段）。
+
+        与 ``delete`` 相同的加锁粒度：先锁定元数据，再锁定目标分片，
+        读-改-写串行化，写回采用原子替换。
+        """
+        if not isinstance(fields, dict):
+            raise TypeError("fields 必须是 dict")
+        with FileLock(lock_path_for(self.meta_path)):
+            meta = self._read_meta()
+            for index in range(meta.get("shard_count", 0)):
+                path = self._shard_path(index)
+                with FileLock(lock_path_for(path)):
+                    records = self._read_shard(index)
+                    for i, record in enumerate(records):
+                        if record.get("id") == record_id:
+                            if record.get("_deleted"):
+                                return False
+                            updated = dict(record)
+                            updated.update(fields)
+                            updated["id"] = record_id
+                            updated["_modified"] = time.time()
+                            records[i] = updated
+                            self._write_shard(index, records)
+                            return True
+        return False
+
     # -- 删除（墓碑） -----------------------------------------------------
     def delete(self, record_id: str) -> bool:
         with FileLock(lock_path_for(self.meta_path)):

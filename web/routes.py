@@ -16,7 +16,8 @@ from flask import Blueprint, current_app, jsonify, request
 
 from nlp import (get_constituency_parser, get_embeddings, get_keywords, get_ner,
                  get_parser, get_segmenter, get_sentiment, get_summarizer,
-                 get_tagger, get_translator, ENTITY_TYPE_NAMES, TAG_NAMES,
+                 get_tagger, get_translator, get_clusterer, ClusterIndex,
+                 ENTITY_TYPE_NAMES, TAG_NAMES,
                  DEP_REL_NAMES, PHRASE_NAMES, POLARITY_NAMES)
 from nlp.lexicon import STOPWORDS
 from storage import StoreRegistry
@@ -181,6 +182,27 @@ def get_corpus(cid: str):
 @api.delete("/corpus/<cid>")
 def delete_corpus(cid: str):
     ok = _registry().task("corpus").delete(cid)
+    return jsonify({"ok": ok})
+
+
+@api.put("/corpus/<cid>")
+def update_corpus(cid: str):
+    """编辑语料（名称 / 正文）。修改后下次聚类只会重算这篇文档。"""
+    record = _registry().task("corpus").get(cid)
+    if not record or record.get("_deleted"):
+        return jsonify({"error": "语料不存在"}), 404
+    data = _payload()
+    fields = {}
+    if "name" in data:
+        fields["name"] = (data.get("name") or "").strip() or record.get("name")
+    if "text" in data:
+        text = (data.get("text") or "").strip()
+        if not text:
+            return jsonify({"error": "语料内容不能为空"}), 400
+        fields["text"] = text
+    if not fields:
+        return jsonify({"error": "没有需要更新的字段"}), 400
+    ok = _registry().task("corpus").update(cid, fields)
     return jsonify({"ok": ok})
 
 
@@ -438,6 +460,168 @@ def _load_embeddings():
         emb.dim = data.get("dim", 0)
     except (json.JSONDecodeError, OSError):
         pass
+
+
+# ---------------------------------------------------------------------------
+# 话题聚类（增量、确定性）
+# ---------------------------------------------------------------------------
+
+def _cluster_state_path() -> str:
+    import os
+    return os.path.join(_models_dir(), "cluster_state.json")
+
+
+def _load_cluster_index() -> ClusterIndex:
+    import os
+    path = _cluster_state_path()
+    state = None
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                state = json.load(fh)
+        except (json.JSONDecodeError, OSError):
+            state = None
+    return ClusterIndex(clusterer=get_clusterer(), state=state)
+
+
+def _save_cluster_index(index: ClusterIndex) -> None:
+    with open(_cluster_state_path(), "w", encoding="utf-8") as fh:
+        json.dump(index.state, fh, ensure_ascii=False)
+
+
+def _corpus_documents(corpus_ids: Optional[list] = None) -> dict:
+    """从分片语料库取 ``{doc_id: text}``（跳过墓碑与空文本）。"""
+    store = _registry().task("corpus")
+    if corpus_ids:
+        docs = {}
+        for cid in corpus_ids:
+            record = store.get(cid)
+            if record and not record.get("_deleted") and record.get("text"):
+                docs[cid] = record["text"]
+        return docs
+    return {r["id"]: r["text"] for r in store.all()
+            if not r.get("_deleted") and r.get("text")}
+
+
+def _doc_meta(doc_ids) -> dict:
+    """给聚类结果补充文档名称 / 预览（请求时实时关联，保证删改后一致）。"""
+    store = _registry().task("corpus")
+    meta = {}
+    for did in doc_ids:
+        record = store.get(did)
+        if not record or record.get("_deleted"):
+            continue
+        text = record.get("text", "")
+        meta[did] = {
+            "name": record.get("name", "未命名"),
+            "length": len(text),
+            "preview": text[:120],
+        }
+    return meta
+
+
+def _cluster_payload(result: dict) -> dict:
+    payload = dict(result)
+    doc_ids = list(result.get("assignments", {})) + result.get("excluded", [])
+    payload["documents"] = _doc_meta(doc_ids)
+    return payload
+
+
+@api.post("/cluster/run")
+def cluster_run():
+    """增量聚类：只重算新增 / 变更 / 删除文档受影响的部分。
+
+    请求体::
+
+        {
+          "corpus_ids": ["corpus_1", ...],   // 可选，默认全部语料
+          "n_clusters": 4,                    // 可选，缺省 / 0 = 自动估计
+          "max_k": 8,                         // 自动估计时的候选上限
+          "n_keywords": 8,                    // 每簇关键词数
+          "n_representatives": 5              // 每簇代表文档数
+        }
+    """
+    data = _payload()
+    documents = _corpus_documents(data.get("corpus_ids"))
+    if not documents:
+        return jsonify({"error": "没有可聚类的文档，请先在语料库中添加文档"}), 400
+
+    n_clusters = data.get("n_clusters") or None
+    params = {
+        "n_clusters": int(n_clusters) if n_clusters else None,
+        "max_k": int(data.get("max_k") or 0) or None,   # None = √n 默认上限
+        "n_keywords": int(data.get("n_keywords", 8)),
+        "n_representatives": int(data.get("n_representatives", 5)),
+    }
+    index = _load_cluster_index()
+    try:
+        out = index.update(documents, params)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    _save_cluster_index(index)
+    return jsonify({
+        "ok": True,
+        "reused": out["reused"],
+        "updates": out["updates"],
+        "result": _cluster_payload(out["result"]),
+    })
+
+
+@api.get("/cluster/result")
+def cluster_result():
+    """最近一次聚类结果（含话题标签、关键词、簇间距离、话题地图坐标）。"""
+    index = _load_cluster_index()
+    result = index.state.get("result")
+    if not result:
+        return jsonify({"error": "尚未聚类，请先执行聚类"}), 404
+    return jsonify({"ok": True, "result": _cluster_payload(result)})
+
+
+@api.get("/cluster/docs")
+def cluster_docs():
+    """某话题簇的文档列表，按代表性排序（点进簇查看）。"""
+    index = _load_cluster_index()
+    result = index.state.get("result")
+    if not result:
+        return jsonify({"error": "尚未聚类，请先执行聚类"}), 404
+    try:
+        cluster_id = int(request.args.get("cluster", ""))
+    except ValueError:
+        return jsonify({"error": "缺少有效的 cluster 参数"}), 400
+
+    members = []
+    for doc_id, info in result.get("assignments", {}).items():
+        if info.get("cluster") == cluster_id:
+            members.append((doc_id, info))
+    members.sort(key=lambda x: (-x[1].get("score", 0.0), x[0]))
+
+    meta = _doc_meta([d for d, _ in members])
+    docs = [{
+        "doc_id": d,
+        "name": meta.get(d, {}).get("name", "未命名"),
+        "preview": meta.get(d, {}).get("preview", ""),
+        "length": meta.get(d, {}).get("length", 0),
+        "score": info.get("score"),
+        "confidence": info.get("confidence"),
+        "ambiguous": info.get("ambiguous", False),
+    } for d, info in members]
+    cluster = next((c for c in result.get("clusters", [])
+                    if c.get("id") == cluster_id), None)
+    return jsonify({
+        "ok": True,
+        "cluster": cluster,
+        "docs": docs,
+    })
+
+
+@api.post("/cluster/reset")
+def cluster_reset():
+    """清空聚类索引（缓存的词频与结果），下次聚类从头计算。"""
+    import os
+    path = _cluster_state_path()
+    if os.path.exists(path):
+        os.remove(path)
+    return jsonify({"ok": True})
 
 
 # ---------------------------------------------------------------------------

@@ -12,6 +12,7 @@ const PAGES = [
   { file: "translate.html", name: "机器翻译",     desc: "模拟翻译" },
   { file: "keywords.html",  name: "关键词提取",   desc: "TF-IDF + TextRank" },
   { file: "embedding.html", name: "词向量可视化", desc: "降维投影" },
+  { file: "cluster.html",   name: "话题聚类",     desc: "增量文档聚类" },
   { file: "pipeline.html",  name: "流水线配置",   desc: "编排与执行" },
 ];
 
@@ -19,7 +20,7 @@ const PAGE_NAMES = {
   corpus: "语料库管理", segment: "分词与词性标注", parse: "句法分析树",
   ner: "命名实体识别", sentiment: "情感分析", summary: "文本摘要",
   translate: "机器翻译", keywords: "关键词提取", embedding: "词向量可视化",
-  pipeline: "流水线配置与执行",
+  cluster: "话题聚类", pipeline: "流水线配置与执行",
 };
 
 // 中文标签集（与后端 /api/meta 一致，离线可用）

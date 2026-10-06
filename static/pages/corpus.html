@@ -28,6 +28,7 @@
         </div>
         <div class="row">
           <button class="btn" id="btn-add">添加语料</button>
+          <button class="btn secondary small" id="btn-cancel-edit" style="display:none">取消编辑</button>
           <span class="muted small">或</span>
         </div>
         <div class="mt">
@@ -72,6 +73,7 @@
 renderNav("corpus.html");
 
 let currentCorpora = [];
+let editingId = null;   // 非空时表示表单处于「编辑已有语料」模式
 
 async function loadCorpora() {
   const list = $("#corpus-list");
@@ -90,6 +92,7 @@ async function loadCorpora() {
             <div class="preview mt">${esc(c.preview)}</div>
           </div>
           <button class="btn secondary small" onclick="viewCorpus('${esc(c.id)}')">查看</button>
+          <button class="btn secondary small" onclick="editCorpus('${esc(c.id)}')">编辑</button>
           <button class="btn danger small" onclick="delCorpus('${esc(c.id)}')">删除</button>
         </div>`).join("");
     }
@@ -104,15 +107,41 @@ async function addCorpus() {
   const name = $("#corpus-name").value.trim();
   if (!text) return toast("请输入语料内容", "err");
   const btn = $("#btn-add");
-  setLoading(btn, true, "添加中…");
+  setLoading(btn, true, editingId ? "保存中…" : "添加中…");
   try {
-    await api("/api/corpus", { method: "POST", body: { name, text } });
-    toast("语料已添加");
-    $("#corpus-text").value = "";
-    $("#corpus-name").value = "";
+    if (editingId) {
+      await api(`/api/corpus/${editingId}`, { method: "PUT", body: { name, text } });
+      toast("语料已更新（下次聚类将只重算这篇文档）");
+      cancelEdit();
+    } else {
+      await api("/api/corpus", { method: "POST", body: { name, text } });
+      toast("语料已添加");
+      $("#corpus-text").value = "";
+      $("#corpus-name").value = "";
+    }
     loadCorpora();
   } catch (e) { toast(e.message, "err"); }
   setLoading(btn, false);
+}
+
+async function editCorpus(id) {
+  try {
+    const r = await api(`/api/corpus/${id}`);
+    editingId = id;
+    $("#corpus-name").value = r.name || "";
+    $("#corpus-text").value = r.text || "";
+    $("#btn-add").textContent = "保存修改";
+    $("#btn-cancel-edit").style.display = "";
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  } catch (e) { toast(e.message, "err"); }
+}
+
+function cancelEdit() {
+  editingId = null;
+  $("#corpus-name").value = "";
+  $("#corpus-text").value = "";
+  $("#btn-add").textContent = "添加语料";
+  $("#btn-cancel-edit").style.display = "none";
 }
 
 async function viewCorpus(id) {
@@ -166,6 +195,7 @@ $("#corpus-file").addEventListener("change", async (ev) => {
 });
 
 $("#btn-add").addEventListener("click", addCorpus);
+$("#btn-cancel-edit").addEventListener("click", cancelEdit);
 $("#btn-refresh").addEventListener("click", loadCorpora);
 $("#btn-clean").addEventListener("click", cleanCorpus);
 

@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>话题聚类 - NLP 流水线平台</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+  <style>
+    .map { width: 100%; border: 1px solid var(--border); border-radius: 10px; background: #fff; }
+    .kw-chip { display: inline-block; padding: 2px 10px; margin: 2px 4px 2px 0; border-radius: 999px;
+      background: var(--primary-soft); color: var(--primary); font-size: 12px; font-weight: 600; }
+    .cluster-card { border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; margin-bottom: 14px; }
+    .cluster-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .cluster-dot { width: 12px; height: 12px; border-radius: 50%; flex: none; }
+    .cluster-label { font-weight: 700; font-size: 15px; }
+    .rep-item { display: flex; justify-content: space-between; gap: 10px; padding: 5px 0;
+      border-bottom: 1px dashed var(--border); font-size: 13px; }
+    .rep-item:last-child { border-bottom: none; }
+    .doc-list { margin-top: 10px; display: none; }
+    .doc-list.open { display: block; }
+    .conf-bar { width: 90px; height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; flex: none; }
+    .conf-bar > i { display: block; height: 100%; background: var(--green); }
+    .heat { border-collapse: collapse; margin-top: 6px; }
+    .heat th, .heat td { padding: 5px 9px; font-size: 12px; text-align: center; border: 1px solid var(--border); }
+    .heat th { background: var(--surface-2); font-weight: 600; max-width: 130px;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .kbar-row { display: flex; align-items: center; gap: 8px; margin: 3px 0; font-size: 12px; }
+    .kbar-row .kbar { height: 12px; border-radius: 3px; background: var(--primary); opacity: .8; }
+    .kbar-row.best .kbar { background: var(--green); }
+    .stat-grid { display: flex; gap: 22px; flex-wrap: wrap; font-size: 14px; }
+    .stat-grid b { font-size: 18px; display: block; }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="site-sidebar"></aside>
+
+  <main class="main">
+    <h1 class="page-title">话题聚类</h1>
+    <p class="page-desc">按内容把语料库文档自动聚成话题簇：球面 k-means（确定性初始化，结果可复现）+
+      c-TF-IDF 话题标签；语料增删改时只增量重算受影响文档。</p>
+
+    <!-- 控制条 -->
+    <section class="card">
+      <div class="row">
+        <div style="width:130px"><label>话题数（0=自动）</label>
+          <input type="number" id="n-clusters" value="0" min="0" max="50"></div>
+        <div style="width:150px"><label>自动估计上限（0=√n）</label>
+          <input type="number" id="max-k" value="0" min="0" max="30"></div>
+        <div style="width:130px"><label>每簇关键词数</label>
+          <input type="number" id="n-keywords" value="8" min="3" max="20"></div>
+        <button class="btn" id="btn-run">开始聚类</button>
+        <button class="btn secondary" id="btn-demo">载入示例文档</button>
+        <button class="btn secondary" id="btn-reset">重置索引</button>
+        <span class="badge blue" id="run-state">尚未聚类</span>
+      </div>
+      <p class="muted small mt">聚类基于语料库全部分片文档；新增 / 修改 / 删除文档后再次聚类，只会重算受影响的文档（增量更新），语料未变时直接复用上次结果。</p>
+    </section>
+
+    <!-- 概览 -->
+    <section class="card" id="overview-card" style="display:none">
+      <h2>聚类概览</h2>
+      <div class="stat-grid" id="overview"></div>
+      <div id="k-scores" class="mt"></div>
+    </section>
+
+    <!-- 话题地图 -->
+    <section class="card" id="map-card" style="display:none">
+      <h2>话题地图（簇间远近：MDS 投影，气泡大小 = 文档数）</h2>
+      <svg class="map" id="map" viewBox="0 0 860 420" height="420"></svg>
+      <h3 class="mt">簇间距离矩阵（余弦距离，颜色越深越远）</h3>
+      <div id="heatmap" style="overflow-x:auto"></div>
+    </section>
+
+    <!-- 话题簇列表 -->
+    <section class="card" id="clusters-card" style="display:none">
+      <h2>话题簇</h2>
+      <div id="clusters"></div>
+      <div id="excluded" class="mt"></div>
+    </section>
+  </main>
+</div>
+
+<script src="/static/js/common.js"></script>
+<script>
+renderNav("cluster.html");
+
+const CLUSTER_COLORS = ["#4f6ef7", "#16a34a", "#d97706", "#dc2626", "#7c3aed",
+  "#0891b2", "#be185d", "#65a30d", "#ea580c", "#2563eb"];
+const colorOf = i => CLUSTER_COLORS[i % CLUSTER_COLORS.length];
+
+let RESULT = null;   // 最近一次聚类结果（含 documents 元数据）
+
+/* ---------- 聚类 ---------- */
+async function runCluster() {
+  const btn = $("#btn-run");
+  setLoading(btn, true, "聚类中…");
+  try {
+    const r = await api("/api/cluster/run", {
+      method: "POST",
+      body: {
+        n_clusters: parseInt($("#n-clusters").value) || 0,
+        max_k: parseInt($("#max-k").value) || 0,
+        n_keywords: parseInt($("#n-keywords").value) || 8,
+      },
+    });
+    const u = r.updates;
+    $("#run-state").textContent = r.reused
+      ? "语料未变化，已复用上次结果"
+      : `已更新：新增 ${u.added} · 变更 ${u.changed} · 删除 ${u.removed} · 重算向量 ${u.vectorized}`;
+    toast(r.reused ? "语料与参数未变，复用上次聚类结果" : "聚类完成");
+    render(r.result);
+  } catch (e) { toast(e.message, "err"); }
+  setLoading(btn, false);
+}
+
+async function loadResult() {
+  try {
+    const r = await api("/api/cluster/result");
+    $("#run-state").textContent = `已加载上次结果（${fmtTime(r.result.created_at)}）`;
+    render(r.result);
+  } catch (_) {
+    $("#run-state").textContent = "尚未聚类";
+  }
+}
+
+/* ---------- 渲染 ---------- */
+function render(result) {
+  RESULT = result;
+  $("#overview-card").style.display = "";
+  $("#map-card").style.display = "";
+  $("#clusters-card").style.display = "";
+  renderOverview(result);
+  renderMap(result);
+  renderHeatmap(result);
+  renderClusters(result);
+}
+
+function renderOverview(r) {
+  const kMode = r.auto_k ? `${r.n_clusters}（自动估计）` : `${r.n_clusters}（用户指定）`;
+  $("#overview").innerHTML = `
+    <div><b>${r.n_docs}</b>文档总数</div>
+    <div><b>${r.n_clusters}</b>话题簇 ${kMode}</div>
+    <div><b>${r.silhouette}</b>轮廓系数（越接近 1 划分越清晰）</div>
+    <div><b>${r.excluded.length}</b>未参与聚类（无有效词）</div>`;
+  if (r.auto_k && r.k_scores && r.k_scores.length > 1) {
+    const best = Math.max(...r.k_scores.map(s => s.score));
+    $("#k-scores").innerHTML = `<h3>候选话题数得分（轮廓系数）</h3>` + r.k_scores.map(s => `
+      <div class="kbar-row ${s.score === best ? "best" : ""}">
+        <span style="width:44px">k=${s.k}</span>
+        <div class="kbar" style="width:${Math.max(4, s.score * 320)}px"></div>
+        <span class="muted">${s.score}</span>
+      </div>`).join("");
+  } else {
+    $("#k-scores").innerHTML = "";
+  }
+}
+
+function renderMap(r) {
+  const svg = $("#map");
+  const cs = r.clusters;
+  if (!cs.length) { svg.innerHTML = ""; return; }
+  const W = 860, H = 420, pad = 70;
+  const xs = cs.map(c => c.center[0]), ys = cs.map(c => c.center[1]);
+  const spanX = (Math.max(...xs) - Math.min(...xs)) || 1;
+  const spanY = (Math.max(...ys) - Math.min(...ys)) || 1;
+  const sx = c => pad + (c.center[0] - Math.min(...xs)) / spanX * (W - 2 * pad);
+  const sy = c => H - pad - (c.center[1] - Math.min(...ys)) / spanY * (H - 2 * pad);
+
+  // 簇间连线：距离越近线越粗越明显
+  let edges = "";
+  for (let i = 0; i < cs.length; i++)
+    for (let j = i + 1; j < cs.length; j++) {
+      const d = r.distances[i][j];
+      const prox = 1 - d;
+      if (prox <= 0.05) continue;
+      edges += `<line x1="${sx(cs[i])}" y1="${sy(cs[i])}" x2="${sx(cs[j])}" y2="${sy(cs[j])}"
+        stroke="#94a3b8" stroke-width="${(0.5 + prox * 3).toFixed(1)}" opacity="${(prox * 0.7).toFixed(2)}">
+        <title>距离 ${d}</title></line>`;
+    }
+
+  const bubbles = cs.map(c => {
+    const radius = 16 + 7 * Math.sqrt(c.size);
+    return `<g style="cursor:pointer" onclick="scrollToCluster(${c.id})">
+      <circle cx="${sx(c)}" cy="${sy(c)}" r="${radius}" fill="${colorOf(c.id)}" opacity="0.82">
+        <title>${esc(c.label)}（${c.size} 篇）</title></circle>
+      <text x="${sx(c)}" y="${sy(c) + 4}" font-size="13" fill="#fff" text-anchor="middle" font-weight="700">${c.size}</text>
+      <text x="${sx(c)}" y="${sy(c) + radius + 16}" font-size="12" fill="#374151" text-anchor="middle">${esc(c.label)}</text>
+    </g>`;
+  }).join("");
+
+  svg.innerHTML = `<rect width="100%" height="100%" fill="#fff"/>${edges}${bubbles}`;
+}
+
+function renderHeatmap(r) {
+  const cs = r.clusters;
+  const head = cs.map(c => `<th title="${esc(c.label)}">${esc(c.label.slice(0, 8))}</th>`).join("");
+  const rows = cs.map((c, i) => {
+    const tds = cs.map((_, j) => {
+      const d = r.distances[i][j];
+      const bg = i === j ? "#f1f5f9" : `rgba(79,110,247,${(d * 0.85).toFixed(2)})`;
+      const fg = i === j ? "#94a3b8" : (d > 0.45 ? "#fff" : "#1f2430");
+      return `<td style="background:${bg};color:${fg}">${i === j ? "—" : d.toFixed(2)}</td>`;
+    }).join("");
+    return `<tr><th title="${esc(c.label)}">${esc(c.label.slice(0, 8))}</th>${tds}</tr>`;
+  }).join("");
+  $("#heatmap").innerHTML = `<table class="heat"><tr><th></th>${head}</tr>${rows}</table>`;
+}
+
+function renderClusters(r) {
+  const host = $("#clusters");
+  host.innerHTML = r.clusters.map(c => {
+    const kws = c.keywords.map(k => `<span class="kw-chip">${esc(k.word)}</span>`).join("");
+    const reps = c.representatives.map(rep => {
+      const doc = (r.documents || {})[rep.doc_id] || {};
+      return `<div class="rep-item"><span>${esc(doc.name || rep.doc_id)}</span>
+        <span class="muted" style="font-family:var(--mono)">${rep.score}</span></div>`;
+    }).join("");
+    return `<div class="cluster-card" id="cluster-${c.id}">
+      <div class="cluster-head">
+        <span class="cluster-dot" style="background:${colorOf(c.id)}"></span>
+        <span class="cluster-label">${esc(c.label)}</span>
+        <span class="badge blue">${c.size} 篇</span>
+        <span class="badge green">内聚度 ${c.cohesion}</span>
+        <span style="flex:1"></span>
+        <button class="btn secondary small" onclick="toggleDocs(${c.id})">查看文档</button>
+      </div>
+      <div class="mt">${kws}</div>
+      <h3 class="mt">代表文档</h3>
+      ${reps || '<span class="muted small">无</span>'}
+      <div class="doc-list" id="docs-${c.id}"></div>
+    </div>`;
+  }).join("");
+
+  if (r.excluded && r.excluded.length) {
+    const names = r.excluded.map(d => esc(((r.documents || {})[d] || {}).name || d)).join("、");
+    $("#excluded").innerHTML = `<span class="badge amber">未参与聚类（无有效词）：${names}</span>`;
+  } else {
+    $("#excluded").innerHTML = "";
+  }
+}
+
+/* ---------- 簇内文档（点进某簇） ---------- */
+async function toggleDocs(clusterId) {
+  const box = $(`#docs-${clusterId}`);
+  if (box.classList.contains("open")) { box.classList.remove("open"); return; }
+  try {
+    const r = await api(`/api/cluster/docs?cluster=${clusterId}`);
+    box.innerHTML = `<h3>全部文档（按代表性排序，共 ${r.docs.length} 篇）</h3>` + r.docs.map(d => `
+      <div class="rep-item">
+        <span>${esc(d.name)}${d.ambiguous ? ' <span class="badge amber small">边界模糊</span>' : ""}
+          <div class="muted small">${esc(d.preview)}</div></span>
+        <span style="display:flex;align-items:center;gap:8px">
+          <span class="conf-bar" title="置信度 ${d.confidence}"><i style="width:${Math.round(d.confidence * 100)}%"></i></span>
+          <span class="muted" style="font-family:var(--mono)">${d.score}</span>
+        </span>
+      </div>`).join("");
+    box.classList.add("open");
+  } catch (e) { toast(e.message, "err"); }
+}
+
+function scrollToCluster(clusterId) {
+  const el = $(`#cluster-${clusterId}`);
+  if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+/* ---------- 示例与重置 ---------- */
+const DEMO_DOCS = [
+  ["科技-大模型", "人工智能大模型在推理和代码生成任务上显著提升，算法效率再创新高。"],
+  ["科技-AI芯片", "新款人工智能芯片发布，专为深度学习模型推理优化，算力大幅提升。"],
+  ["科技-推荐系统", "机器学习算法驱动的推荐系统上线，人工智能平台用户增长明显。"],
+  ["科技-应用落地", "大模型训练成本持续下降，人工智能应用加速落地，算法部署效率提升。"],
+  ["体育-足球联赛", "足球联赛焦点战，主队前锋梅开二度，球队赢得比赛登上积分榜首。"],
+  ["体育-篮球季后赛", "篮球联赛季后赛，后卫命中关键三分，球队赢得比赛晋级下一轮。"],
+  ["体育-杯赛冷门", "足球杯赛爆出冷门，小球队淘汰卫冕冠军，前锋打进制胜进球。"],
+  ["体育-积分榜", "联赛积分榜竞争激烈，三支球队同分，下轮比赛决定最终排名。"],
+  ["美食-红烧肉", "红烧肉讲究火候，五花肉慢炖入味，是经典的家常味道。"],
+  ["美食-清蒸鱼", "清蒸鱼讲究食材新鲜，火候恰到好处，味道鲜美可口。"],
+  ["美食-麻婆豆腐", "麻婆豆腐讲究麻辣入味，豆腐鲜嫩下饭，是川菜的经典味道。"],
+  ["美食-老火靓汤", "老火靓汤讲究食材搭配，慢火煲煮数小时，汤清味浓味道醇厚。"],
+  ["财经-股市", "股市三大指数集体收涨，科技板块领涨，市场成交额突破万亿。"],
+  ["财经-央行降准", "央行降准释放流动性，债券市场走强，市场投资者信心回升。"],
+  ["财经-基金", "基金发行市场回暖，多只权益基金提前结束募集，股市情绪改善。"],
+  ["财经-汇率", "人民币汇率稳中有升，出口企业受益，市场对经济预期向好。"],
+];
+
+async function seedDemo() {
+  const btn = $("#btn-demo");
+  setLoading(btn, true, "写入中…");
+  try {
+    for (const [name, text] of DEMO_DOCS) {
+      await api("/api/corpus", { method: "POST", body: { name, text } });
+    }
+    toast(`已添加 ${DEMO_DOCS.length} 篇示例文档`);
+    await runCluster();
+  } catch (e) { toast(e.message, "err"); }
+  setLoading(btn, false);
+}
+
+async function resetIndex() {
+  if (!confirm("清空聚类索引（缓存的词频与结果）？语料本身不受影响。")) return;
+  try {
+    await api("/api/cluster/reset", { method: "POST" });
+    toast("索引已重置");
+    location.reload();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+$("#btn-run").addEventListener("click", runCluster);
+$("#btn-demo").addEventListener("click", seedDemo);
+$("#btn-reset").addEventListener("click", resetIndex);
+
+loadResult();
+</script>
+</body>
+</html>
